@@ -1,0 +1,14 @@
+# Add this site block into your main HomeLab Caddyfile.
+# This keeps Bomana update service in a separate compose stack.
+
+bomanaupdate.ruikang.wang {
+  import compression
+  import security_headers
+
+  reverse_proxy host.docker.internal:18080 {
+    import rp_defaults
+    health_uri /healthz
+    fail_duration 10s
+    max_fails 3
+  }
+}

@@ -1,0 +1,20 @@
+services:
+  bomana-update:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: bomana-update
+    restart: always
+    environment:
+      MANIFEST_DIR: /data/manifests
+      DB_PATH: /data/stats.db
+      SOURCE_NAME: TencentCloud
+      STATS_ONLY_MODE: "1"
+      MANIFEST_MODE: github_then_local
+      GITHUB_REPO_OWNER: Thankyou-Cheems
+      GITHUB_REPO_NAME: Bomana
+      GITHUB_CACHE_TTL_SEC: "300"
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:18080:8080"

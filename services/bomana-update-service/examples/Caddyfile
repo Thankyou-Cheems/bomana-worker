@@ -1,0 +1,8 @@
+update.example.com {
+    encode zstd gzip
+
+    @api path /healthz /api/*
+    handle @api {
+        reverse_proxy 127.0.0.1:18080
+    }
+}

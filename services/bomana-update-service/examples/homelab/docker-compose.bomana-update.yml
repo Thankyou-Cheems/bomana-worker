@@ -1,0 +1,35 @@
+name: bomana-update
+
+services:
+  bomana-update:
+    container_name: bomana-update
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      MANIFEST_DIR: /data/manifests
+      DB_PATH: /data/stats.db
+      SOURCE_NAME: TencentCloud
+      STATS_ONLY_MODE: "1"
+      MANIFEST_MODE: local_then_github
+      GITHUB_REPO_OWNER: Thankyou-Cheems
+      GITHUB_REPO_NAME: Bomana
+      GITHUB_CACHE_TTL_SEC: "300"
+      HTTP_TIMEOUT_SEC: "20"
+    volumes:
+      - ./data:/data
+    ports:
+      - "18080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
