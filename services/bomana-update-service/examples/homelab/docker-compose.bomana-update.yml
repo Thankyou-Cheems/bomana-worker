@@ -16,6 +16,8 @@ services:
       MANIFEST_MODE: local_then_github
       GITHUB_REPO_OWNER: Thankyou-Cheems
       GITHUB_REPO_NAME: Bomana
+      AUTO_GITHUB_PACKAGE_URL: "1"
+      GITHUB_APP_RELEASE_TAG_SUFFIX: "-app"
       GITHUB_CACHE_TTL_SEC: "300"
       HTTP_TIMEOUT_SEC: "20"
     volumes:

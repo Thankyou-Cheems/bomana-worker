@@ -23,6 +23,8 @@ MANIFEST_MODE = os.environ.get("MANIFEST_MODE", "github_then_local").strip().low
 GITHUB_REPO_OWNER = os.environ.get("GITHUB_REPO_OWNER", "Thankyou-Cheems").strip()
 GITHUB_REPO_NAME = os.environ.get("GITHUB_REPO_NAME", "Bomana").strip()
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+AUTO_GITHUB_PACKAGE_URL = os.environ.get("AUTO_GITHUB_PACKAGE_URL", "1").strip().lower() not in {"0", "false", "off", "no"}
+GITHUB_APP_RELEASE_TAG_SUFFIX = os.environ.get("GITHUB_APP_RELEASE_TAG_SUFFIX", "-app").strip()
 GITHUB_CACHE_TTL_SEC = max(30, int(os.environ.get("GITHUB_CACHE_TTL_SEC", "300").strip() or "300"))
 HTTP_TIMEOUT_SEC = max(2.0, float(os.environ.get("HTTP_TIMEOUT_SEC", "8").strip() or "8"))
 UA = "BomanaUpdateService/1.0"
@@ -133,6 +135,20 @@ def _find_asset(assets: list, name: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _build_github_release_asset_url(app_version: str, package_asset: str) -> str:
+    if not app_version or not package_asset:
+        return ""
+    if not GITHUB_REPO_OWNER or not GITHUB_REPO_NAME:
+        return ""
+
+    tag_prefix = app_version if app_version.lower().startswith("v") else f"v{app_version}"
+    tag = f"{tag_prefix}{GITHUB_APP_RELEASE_TAG_SUFFIX}"
+    return (
+        f"https://github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}"
+        f"/releases/download/{tag}/{package_asset}"
+    )
+
+
 def _build_manifest_result(
     data: Dict[str, Any],
     source_name: str,
@@ -151,11 +167,24 @@ def _build_manifest_result(
         asset = _find_asset(release_assets, package_asset)
         if asset:
             package_url = str(asset.get("browser_download_url", "")).strip()
+    if (
+        not package_url
+        and STATS_ONLY_MODE
+        and AUTO_GITHUB_PACKAGE_URL
+        and package_asset
+    ):
+        package_url = _build_github_release_asset_url(app_version, package_asset)
 
     # Stats-only mode: do not serve downloadable files from this server unless explicit URL is provided.
     if STATS_ONLY_MODE:
         if not package_url:
-            raise HTTPException(status_code=500, detail="STATS_ONLY_MODE requires manifest.package_url")
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "STATS_ONLY_MODE requires manifest.package_url "
+                    "or auto-generated package_url (need app_version + package_asset)"
+                ),
+            )
     else:
         # Compatibility mode:
         # 1) explicit package_url in manifest

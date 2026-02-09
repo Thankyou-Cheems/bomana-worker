@@ -38,8 +38,10 @@
 说明：
 
 - 存在 `package_url` 时，服务直接返回该地址
+- 若缺少 `package_url` 且包含 `app_version + package_asset`，服务可自动按 GitHub 规则拼接下载地址：
+  `https://github.com/<owner>/<repo>/releases/download/v<app_version>-app/<package_asset>`
 - 此模式下无需在云服务器托管 `/downloads/*`
-- 默认 `STATS_ONLY_MODE=1`，服务会强制要求 `package_url`
+- 默认 `STATS_ONLY_MODE=1`，建议保留 `AUTO_GITHUB_PACKAGE_URL=1`（默认已开启）
 
 ## 目录结构
 
@@ -58,6 +60,7 @@ data/
    - `STATS_ONLY_MODE="1"`
    - `MANIFEST_MODE=github_then_local`
    - `GITHUB_REPO_OWNER` / `GITHUB_REPO_NAME`
+   - `AUTO_GITHUB_PACKAGE_URL="1"`（推荐）
 2. 启动服务：
 
 ```bash

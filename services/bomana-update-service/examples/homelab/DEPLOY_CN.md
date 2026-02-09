@@ -33,7 +33,10 @@ sudo mkdir -p /opt/stacks/bomana-update/data/manifests
 - `manifest_Standard.json`
 - `manifest_Lite.json`
 
-兜底文件要求：每个 manifest 必须包含 `package_url`（GitHub Release 下载直链）。
+兜底文件要求：
+
+- 推荐包含 `package_url`（GitHub Release 下载直链）；
+- 若未提供 `package_url`，请至少包含 `app_version + package_asset`，并确保 `AUTO_GITHUB_PACKAGE_URL=1`（默认开启），服务会自动拼接 GitHub 下载地址。
 
 ## 4. 启动独立栈
 
