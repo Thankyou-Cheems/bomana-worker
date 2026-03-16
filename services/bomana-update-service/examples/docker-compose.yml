@@ -4,17 +4,30 @@ services:
       context: ..
       dockerfile: Dockerfile
     container_name: bomana-update
-    restart: always
+    restart: unless-stopped
     environment:
+      TZ: Asia/Shanghai
       MANIFEST_DIR: /data/manifests
+      DOWNLOAD_DIR: /data/downloads
+      LAUNCHER_MANIFEST_PATH: /data/launcher_manifest.json
       DB_PATH: /data/stats.db
-      SOURCE_NAME: TencentCloud
-      STATS_ONLY_MODE: "1"
-      MANIFEST_MODE: github_then_local
+      DOWNLOAD_BASE_URL: https://update.example.com
+      SOURCE_NAME: SelfHosted
+      STATS_ONLY_MODE: "0"
+      MANIFEST_MODE: local
       GITHUB_REPO_OWNER: Thankyou-Cheems
       GITHUB_REPO_NAME: Bomana
+      AUTO_GITHUB_PACKAGE_URL: "1"
+      GITHUB_APP_RELEASE_TAG_SUFFIX: "-app"
       GITHUB_CACHE_TTL_SEC: "300"
+      HTTP_TIMEOUT_SEC: "20"
     volumes:
       - ./data:/data
     ports:
       - "127.0.0.1:18080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

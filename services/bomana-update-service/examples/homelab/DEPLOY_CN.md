@@ -1,6 +1,8 @@
-# Bomana Update Service 部署（HomeLab 分离栈）
+# Bomana Update Service 部署（分离栈示例）
 
-目标：将 Bomana 更新统计服务独立于 HomeLab 主 `docker-compose.yml` 运行，只通过主 Caddy 反向代理访问。
+目标：将 Bomana 更新服务独立运行，再通过现有反向代理统一对外暴露。
+
+本文档只给出公开安全的示例，不包含私有域名、主机名或运行时数据。
 
 ## 1. 准备目录
 
@@ -8,74 +10,85 @@
 sudo mkdir -p /opt/stacks/bomana-update/app
 sudo mkdir -p /opt/stacks/bomana-update/data
 sudo mkdir -p /opt/stacks/bomana-update/data/manifests
+sudo mkdir -p /opt/stacks/bomana-update/data/downloads
 ```
 
 ## 2. 复制服务文件
 
-从本仓库 `tools/update_service/` 复制以下文件到服务器：
+从本仓库 `services/bomana-update-service/` 复制以下文件到服务器：
 
 - `Dockerfile` -> `/opt/stacks/bomana-update/app/Dockerfile`
 - `requirements.txt` -> `/opt/stacks/bomana-update/app/requirements.txt`
 - `server.py` -> `/opt/stacks/bomana-update/app/server.py`
 - `examples/homelab/docker-compose.bomana-update.yml` -> `/opt/stacks/bomana-update/docker-compose.yml`
 
-## 3. Manifest 策略（自动 + 可选兜底）
+## 3. 准备运行时数据
 
-当前推荐 `MANIFEST_MODE=local_then_github`（优先本地兜底，GitHub 作为后备），无需手工更新 manifest：
+推荐使用本地 manifest + 同域下载分发：
 
-- 优先读取本地 `/opt/stacks/bomana-update/data/manifests/manifest_<Channel>.json`
-- 本地缺失或异常时自动读取 GitHub latest release 的 `manifest_<Channel>.json`
-- GitHub 结果会缓存（默认 300 秒）
+- `MANIFEST_MODE=local`
+- `STATS_ONLY_MODE=0`
+- `DOWNLOAD_BASE_URL=https://update.example.com`
 
-可选：你也可以放本地兜底文件到 `/opt/stacks/bomana-update/data/manifests/`：
+建议由发布流程自动同步这些文件：
 
-- `manifest_Enhanced.json`
-- `manifest_Standard.json`
-- `manifest_Lite.json`
+- `/opt/stacks/bomana-update/data/manifests/manifest_Enhanced.json`
+- `/opt/stacks/bomana-update/data/manifests/manifest_Standard.json`
+- `/opt/stacks/bomana-update/data/manifests/manifest_Lite.json`
+- `/opt/stacks/bomana-update/data/launcher_manifest.json`
+- `/opt/stacks/bomana-update/data/downloads/Bomana_app_*.zip`
+- `/opt/stacks/bomana-update/data/downloads/Bomana_launcher_v*.exe`
 
-兜底文件要求：
+服务将对外提供：
 
-- 推荐包含 `package_url`（GitHub Release 下载直链）；
-- 若未提供 `package_url`，请至少包含 `app_version + package_asset`，并确保 `AUTO_GITHUB_PACKAGE_URL=1`（默认开启），服务会自动拼接 GitHub 下载地址。
+- `GET /api/v1/version`
+- `GET /api/v1/launcher`
+- `GET /downloads/<asset>`
 
-## 4. 启动独立栈
+## 4. GitHub 回退（可选）
+
+如果你暂时不想自托管所有包体，可以切换到：
+
+- `MANIFEST_MODE=github_then_local`
+- `AUTO_GITHUB_PACKAGE_URL=1`
+
+这时服务会优先读取 GitHub latest release 的 manifest，本地文件作为兜底。
+
+## 5. 启动服务
 
 ```bash
 cd /opt/stacks/bomana-update
 sudo docker compose up -d --build
 ```
 
-默认映射 `18080:8080`，由主 Caddy 通过 `host.docker.internal:18080` 反代访问。
+示例 compose 只监听 `127.0.0.1:18080`，不直接对公网暴露。
 
-## 5. 主 Caddy 接入
+## 6. 配置反向代理
 
-将 `examples/homelab/Caddyfile.bomana-update.snippet` 中的站点块加入你的 HomeLab 主 `Caddyfile`。
+将 `examples/homelab/Caddyfile.bomana-update.snippet` 里的站点块加入你的主 Caddyfile，并把 `update.example.com` 替换成你的真实域名。
 
-然后重载 Caddy：
+服务需要转发的路径包括：
 
-```bash
-cd /opt/HomeLab
-sudo docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
-```
+- `/healthz`
+- `/api/*`
+- `/downloads/*`
 
-## 6. 验证
+## 7. 验证
 
 服务器本机：
 
 ```bash
 curl -s http://127.0.0.1:18080/healthz
 curl -s "http://127.0.0.1:18080/api/v1/version?channel=Enhanced"
-curl -s "http://127.0.0.1:18080/api/v1/version?channel=Enhanced" | jq -r .source_name
+curl -s "http://127.0.0.1:18080/api/v1/launcher"
+curl -I "http://127.0.0.1:18080/downloads/Bomana_launcher_v1.2.0.exe"
 ```
 
 域名链路：
 
 ```bash
-curl -I https://bomanaupdate.ruikang.wang/healthz
-curl -I "https://bomanaupdate.007985.xyz/healthz"
+curl -I https://update.example.com/healthz
+curl -I "https://update.example.com/api/v1/version?channel=Enhanced"
 ```
 
-期望：
-
-- 本机接口返回 `200`，并且 `source_name` 显示本地或 GitHub 来源
-- 域名链路返回 `200`（不再出现 `301` 到其他域名，也不应出现 `525`）
+期望结果：都返回 `200`，并且 `/downloads/*` 可以直接命中服务端静态文件。

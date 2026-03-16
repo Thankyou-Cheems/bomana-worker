@@ -1,5 +1,8 @@
 {
   "name": "bomana-worker",
   "main": "src/index.js",
-  "compatibility_date": "2026-02-06"
+  "compatibility_date": "2026-02-06",
+  "vars": {
+    "UPDATE_ORIGIN": "https://update.example.com"
+  }
 }

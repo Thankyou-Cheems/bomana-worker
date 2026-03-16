@@ -6,17 +6,23 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import quote
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request as URLRequest, urlopen
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request as FastAPIRequest
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 
 MANIFEST_DIR = Path(os.environ.get("MANIFEST_DIR", "/data/manifests"))
 DB_PATH = Path(os.environ.get("DB_PATH", "/data/stats.db"))
+DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/data/downloads"))
+LAUNCHER_MANIFEST_PATH = Path(
+    os.environ.get("LAUNCHER_MANIFEST_PATH", "/data/launcher_manifest.json")
+)
 DOWNLOAD_BASE_URL = os.environ.get("DOWNLOAD_BASE_URL", "").strip().rstrip("/")
-SOURCE_NAME = os.environ.get("SOURCE_NAME", "TencentCloud")
+SOURCE_NAME = os.environ.get("SOURCE_NAME", "SelfHosted")
 ALLOWED_CHANNELS = {"Enhanced", "Standard", "Lite"}
 STATS_ONLY_MODE = os.environ.get("STATS_ONLY_MODE", "1").strip().lower() not in {"0", "false", "off", "no"}
 MANIFEST_MODE = os.environ.get("MANIFEST_MODE", "github_then_local").strip().lower()
@@ -30,6 +36,7 @@ HTTP_TIMEOUT_SEC = max(2.0, float(os.environ.get("HTTP_TIMEOUT_SEC", "8").strip(
 UA = "BomanaUpdateService/1.0"
 
 app = FastAPI(title="Bomana Update Service", version="1.0.0")
+app.mount("/downloads", StaticFiles(directory=str(DOWNLOAD_DIR), check_dir=False), name="downloads")
 _DB_LOCK = threading.Lock()
 _MANIFEST_CACHE_LOCK = threading.Lock()
 _MANIFEST_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -69,6 +76,12 @@ def _db_conn() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_runtime_dirs() -> None:
+    MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    LAUNCHER_MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
 def _init_db() -> None:
     with _DB_LOCK:
         conn = _db_conn()
@@ -104,7 +117,7 @@ def _init_db() -> None:
             conn.close()
 
 
-def _request_ip(request: Request) -> str:
+def _request_ip(request: FastAPIRequest) -> str:
     xff = request.headers.get("x-forwarded-for", "").strip()
     if xff:
         return xff.split(",")[0].strip()
@@ -120,7 +133,7 @@ def _http_get_json(url: str) -> Dict[str, Any]:
     }
     if GITHUB_TOKEN:
         headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-    req = Request(url, headers=headers)
+    req = URLRequest(url, headers=headers)
     with urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
         raw = resp.read()
     if not raw:
@@ -135,6 +148,23 @@ def _find_asset(assets: list, name: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _find_launcher_asset(assets: list) -> Optional[Dict[str, Any]]:
+    for asset in assets:
+        name = str(asset.get("name", "")).strip()
+        if name.lower().startswith("bomana_launcher_v") and name.lower().endswith(".exe"):
+            return asset
+    return None
+
+
+def _build_self_hosted_download_url(asset_name: str) -> str:
+    safe_name = quote(asset_name.strip())
+    if not safe_name:
+        return ""
+    if DOWNLOAD_BASE_URL:
+        return f"{DOWNLOAD_BASE_URL}/downloads/{safe_name}"
+    return f"/downloads/{safe_name}"
+
+
 def _build_github_release_asset_url(app_version: str, package_asset: str) -> str:
     if not app_version or not package_asset:
         return ""
@@ -147,6 +177,15 @@ def _build_github_release_asset_url(app_version: str, package_asset: str) -> str
         f"https://github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}"
         f"/releases/download/{tag}/{package_asset}"
     )
+
+
+def _parse_launcher_version_from_asset_name(asset_name: str) -> str:
+    name = asset_name.strip()
+    prefix = "Bomana_launcher_v"
+    suffix = ".exe"
+    if not name.lower().startswith(prefix.lower()) or not name.lower().endswith(suffix):
+        return ""
+    return name[len(prefix) : -len(suffix)].strip()
 
 
 def _build_manifest_result(
@@ -188,19 +227,57 @@ def _build_manifest_result(
     else:
         # Compatibility mode:
         # 1) explicit package_url in manifest
-        # 2) build from DOWNLOAD_BASE_URL + package_asset (self-hosted downloads)
+        # 2) build from /downloads/<asset> (self-hosted downloads)
         if not package_url:
             if not package_asset:
                 raise HTTPException(status_code=500, detail="manifest missing package_url/package_asset")
-            if not DOWNLOAD_BASE_URL:
-                raise HTTPException(status_code=500, detail="DOWNLOAD_BASE_URL is empty and manifest.package_url is not set")
-            package_url = f"{DOWNLOAD_BASE_URL}/downloads/{package_asset}"
+            package_url = _build_self_hosted_download_url(package_asset)
 
     return {
         "app_version": app_version,
         "package_url": package_url,
         "package_sha256": package_sha256,
         "entrypoint": entrypoint,
+        "source_name": source_name,
+    }
+
+
+def _build_launcher_result(
+    data: Dict[str, Any],
+    source_name: str,
+    release_assets: Optional[list] = None,
+) -> Dict[str, Any]:
+    launcher_version = str(data.get("launcher_version", "")).strip()
+    launcher_url = str(data.get("launcher_url", "")).strip()
+    launcher_asset = str(data.get("launcher_asset", "")).strip()
+    launcher_sha256 = str(data.get("launcher_sha256", "")).strip()
+    launcher_size = data.get("launcher_size_bytes", data.get("launcher_size"))
+
+    if not launcher_version and launcher_asset:
+        launcher_version = _parse_launcher_version_from_asset_name(launcher_asset)
+    if not launcher_version:
+        raise HTTPException(status_code=500, detail="launcher manifest missing required fields")
+
+    if not launcher_url and launcher_asset and release_assets:
+        asset = _find_asset(release_assets, launcher_asset)
+        if asset:
+            launcher_url = str(asset.get("browser_download_url", "")).strip()
+            if launcher_size in (None, ""):
+                launcher_size = asset.get("size")
+
+    if not launcher_url and not STATS_ONLY_MODE:
+        if not launcher_asset:
+            raise HTTPException(status_code=500, detail="launcher manifest missing launcher_url/launcher_asset")
+        launcher_url = _build_self_hosted_download_url(launcher_asset)
+
+    if not launcher_url:
+        raise HTTPException(status_code=500, detail="launcher manifest missing launcher_url")
+
+    return {
+        "launcher_version": launcher_version,
+        "package_url": launcher_url,
+        "package_sha256": launcher_sha256,
+        "package_size": launcher_size,
         "source_name": source_name,
     }
 
@@ -292,7 +369,88 @@ def _load_manifest(channel: str) -> Dict[str, Any]:
         return _load_manifest_from_local(channel)
 
 
-def _insert_event(request: Request, payload: Dict[str, Any]) -> None:
+def _load_launcher_manifest_from_local() -> Dict[str, Any]:
+    path = LAUNCHER_MANIFEST_PATH
+    if not path.exists():
+        raise HTTPException(status_code=503, detail=f"launcher manifest not found: {path.name}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"launcher manifest parse error: {e}")
+    return _build_launcher_result(data, source_name=SOURCE_NAME)
+
+
+def _load_launcher_manifest_from_github() -> Dict[str, Any]:
+    now = time.time()
+    cache_key = "github:launcher"
+    with _MANIFEST_CACHE_LOCK:
+        cached = _MANIFEST_CACHE.get(cache_key)
+        if cached and (now - float(cached.get("ts", 0.0))) < GITHUB_CACHE_TTL_SEC:
+            return dict(cached["value"])
+
+    release_url = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/releases?per_page=20"
+    try:
+        releases = _http_get_json(release_url)
+    except HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"github launcher api http error: {e.code}")
+    except URLError as e:
+        raise HTTPException(status_code=502, detail=f"github launcher api unavailable: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"github launcher api parse error: {e}")
+
+    if not isinstance(releases, list):
+        raise HTTPException(status_code=502, detail="github launcher api returned unexpected payload")
+
+    for release in releases:
+        if not isinstance(release, dict):
+            continue
+        assets = release.get("assets", []) if isinstance(release, dict) else []
+        launcher_asset = _find_launcher_asset(assets)
+        if not launcher_asset:
+            continue
+        asset_name = str(launcher_asset.get("name", "")).strip()
+        version = _parse_launcher_version_from_asset_name(asset_name)
+        url = str(launcher_asset.get("browser_download_url", "")).strip()
+        if not version or not url:
+            continue
+        result = {
+            "launcher_version": version,
+            "package_url": url,
+            "package_sha256": "",
+            "package_size": launcher_asset.get("size"),
+            "source_name": f"{SOURCE_NAME} (GitHub:{str(release.get('tag_name', 'latest')).strip() or 'latest'})",
+        }
+        with _MANIFEST_CACHE_LOCK:
+            _MANIFEST_CACHE[cache_key] = {"ts": now, "value": dict(result)}
+        return result
+
+    raise HTTPException(status_code=503, detail="github latest releases missing launcher asset")
+
+
+def _load_launcher_manifest() -> Dict[str, Any]:
+    mode = MANIFEST_MODE
+    if mode == "local":
+        return _load_launcher_manifest_from_local()
+    if mode == "github":
+        return _load_launcher_manifest_from_github()
+    if mode == "local_then_github":
+        try:
+            return _load_launcher_manifest_from_local()
+        except Exception:
+            return _load_launcher_manifest_from_github()
+    if mode == "github_then_local":
+        try:
+            return _load_launcher_manifest_from_github()
+        except Exception:
+            return _load_launcher_manifest_from_local()
+
+    try:
+        return _load_launcher_manifest_from_github()
+    except Exception:
+        return _load_launcher_manifest_from_local()
+
+
+def _insert_event(request: FastAPIRequest, payload: Dict[str, Any]) -> None:
     event_time = str(payload.get("event_time_utc", "")).strip() or _now_utc_iso()
     day_utc = _day_from_iso(event_time)
     row = {
@@ -350,6 +508,7 @@ def _insert_event(request: Request, payload: Dict[str, Any]) -> None:
 
 @app.on_event("startup")
 def _on_startup() -> None:
+    _ensure_runtime_dirs()
     _init_db()
 
 
@@ -363,7 +522,7 @@ def healthz() -> Dict[str, Any]:
 
 @app.get("/api/v1/version")
 def version(
-    request: Request,
+    request: FastAPIRequest,
     channel: str = Query(..., description="Enhanced | Standard | Lite"),
     launcher_version: str = Query("", description="launcher version"),
     local_version: str = Query("", description="local app version"),
@@ -387,8 +546,31 @@ def version(
     return manifest
 
 
+@app.get("/api/v1/launcher")
+def launcher(
+    request: FastAPIRequest,
+    launcher_version: str = Query("", description="launcher version"),
+    device_id: str = Query("", description="hashed machine id"),
+    install_id: str = Query("", description="install id"),
+) -> Dict[str, Any]:
+    manifest = _load_launcher_manifest()
+    _insert_event(
+        request,
+        {
+            "event": "launcher_version_check",
+            "event_time_utc": _now_utc_iso(),
+            "launcher_version": launcher_version,
+            "local_version": launcher_version,
+            "device_id": device_id,
+            "install_id": install_id,
+            "app_version": manifest.get("launcher_version", ""),
+        },
+    )
+    return manifest
+
+
 @app.post("/api/v1/event")
-def event(request: Request, payload: EventPayload) -> Dict[str, Any]:
+def event(request: FastAPIRequest, payload: EventPayload) -> Dict[str, Any]:
     _insert_event(request, payload.model_dump())
     return {
         "ok": True,
@@ -453,3 +635,181 @@ def stats_daily(
             "dau_unique_install": int(unique_install_dau),
         },
     }
+
+
+@app.get("/api/v1/stats/summary")
+def stats_summary(
+    start_date: str = Query("", description="Start date UTC YYYY-MM-DD (default: first record)"),
+    end_date: str = Query("", description="End date UTC YYYY-MM-DD (default: today)"),
+    channel: str = Query("", description="optional channel filter: Enhanced | Standard | Lite"),
+) -> Dict[str, Any]:
+    """
+    获取历史总统计数据（累计汇总）
+    支持按日期范围和渠道筛选
+    """
+    where = ["1=1"]
+    params = []
+
+    if start_date.strip():
+        where.append("day_utc >= ?")
+        params.append(start_date.strip())
+    if end_date.strip():
+        where.append("day_utc <= ?")
+        params.append(end_date.strip() or datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    if channel.strip():
+        where.append("channel = ?")
+        params.append(channel.strip())
+
+    where_sql = " AND ".join(where)
+
+    with _DB_LOCK:
+        conn = _db_conn()
+        try:
+            # 总体汇总
+            total_events = conn.execute(f"SELECT COUNT(1) AS n FROM events WHERE {where_sql}", params).fetchone()["n"]
+            startup_total = conn.execute(
+                f"SELECT COUNT(1) AS n FROM events WHERE {where_sql} AND event='launcher_start'",
+                params,
+            ).fetchone()["n"]
+            app_launch_total = conn.execute(
+                f"SELECT COUNT(1) AS n FROM events WHERE {where_sql} AND event='app_launch'",
+                params,
+            ).fetchone()["n"]
+            version_check_total = conn.execute(
+                f"SELECT COUNT(1) AS n FROM events WHERE {where_sql} AND event='version_check'",
+                params,
+            ).fetchone()["n"]
+            update_ok_total = conn.execute(
+                f"SELECT COUNT(1) AS n FROM events WHERE {where_sql} AND event='update_result' AND update_ok=1",
+                params,
+            ).fetchone()["n"]
+
+            # DAU 相关 - 总去重用户数
+            unique_device_total = conn.execute(
+                f"SELECT COUNT(DISTINCT device_id) AS n FROM events WHERE {where_sql} AND device_id<>''",
+                params,
+            ).fetchone()["n"]
+            unique_install_total = conn.execute(
+                f"SELECT COUNT(DISTINCT install_id) AS n FROM events WHERE {where_sql} AND install_id<>''",
+                params,
+            ).fetchone()["n"]
+
+            # 获取日期范围
+            date_range = conn.execute(
+                f"SELECT MIN(day_utc) as first_day, MAX(day_utc) as last_day FROM events WHERE {where_sql}",
+                params,
+            ).fetchone()
+
+            # 按渠道分组统计
+            channel_breakdown = {}
+            channel_rows = conn.execute(
+                f"SELECT channel, COUNT(1) as cnt FROM events WHERE {where_sql} GROUP BY channel",
+                params,
+            ).fetchall()
+            for row in channel_rows:
+                channel_breakdown[row["channel"] or ""] = int(row["cnt"])
+
+            # 按事件类型分组统计
+            event_breakdown = {}
+            event_rows = conn.execute(
+                f"SELECT event, COUNT(1) as cnt FROM events WHERE {where_sql} GROUP BY event",
+                params,
+            ).fetchall()
+            for row in event_rows:
+                event_breakdown[row["event"]] = int(row["cnt"])
+
+        finally:
+            conn.close()
+
+    return {
+        "date_range": {
+            "start": start_date.strip() if start_date.strip() else (date_range["first_day"] or ""),
+            "end": end_date.strip() if end_date.strip() else (date_range["last_day"] or ""),
+        },
+        "channel": channel.strip() or "ALL",
+        "metrics": {
+            "total_events": int(total_events),
+            "launcher_start_total": int(startup_total),
+            "app_launch_total": int(app_launch_total),
+            "version_check_total": int(version_check_total),
+            "update_ok_total": int(update_ok_total),
+            "total_unique_device": int(unique_device_total),
+            "total_unique_install": int(unique_install_total),
+        },
+        "breakdown": {
+            "by_channel": channel_breakdown,
+            "by_event": event_breakdown,
+        },
+    }
+
+
+@app.get("/api/v1/stats/daily/list")
+def stats_daily_list(
+    start_date: str = Query("", description="Start date UTC YYYY-MM-DD (default: first record)"),
+    end_date: str = Query("", description="End date UTC YYYY-MM-DD (default: today)"),
+    channel: str = Query("", description="optional channel filter"),
+) -> Dict[str, Any]:
+    """
+    获取每日统计数据列表（按日期分组）
+    用于获取历史 DAU 趋势
+    """
+    where = ["1=1"]
+    params = []
+
+    if start_date.strip():
+        where.append("day_utc >= ?")
+        params.append(start_date.strip())
+    if end_date.strip():
+        where.append("day_utc <= ?")
+        params.append(end_date.strip())
+    if channel.strip():
+        where.append("channel = ?")
+        params.append(channel.strip())
+
+    where_sql = " AND ".join(where)
+
+    with _DB_LOCK:
+        conn = _db_conn()
+        try:
+            # 按日期分组统计
+            daily_stats = []
+            rows = conn.execute(
+                f"""
+                SELECT 
+                    day_utc,
+                    COUNT(1) as total_events,
+                    SUM(CASE WHEN event='launcher_start' THEN 1 ELSE 0 END) as launcher_start_total,
+                    SUM(CASE WHEN event='app_launch' THEN 1 ELSE 0 END) as app_launch_total,
+                    SUM(CASE WHEN event='version_check' THEN 1 ELSE 0 END) as version_check_total,
+                    SUM(CASE WHEN event='update_result' AND update_ok=1 THEN 1 ELSE 0 END) as update_ok_total,
+                    COUNT(DISTINCT CASE WHEN event='version_check' AND device_id<>'' THEN device_id END) as dau_unique_device,
+                    COUNT(DISTINCT CASE WHEN event='version_check' AND install_id<>'' THEN install_id END) as dau_unique_install
+                FROM events 
+                WHERE {where_sql}
+                GROUP BY day_utc
+                ORDER BY day_utc
+                """,
+                params,
+            ).fetchall()
+            for row in rows:
+                daily_stats.append({
+                    "date_utc": row["day_utc"],
+                    "metrics": {
+                        "total_events": int(row["total_events"]),
+                        "launcher_start_total": int(row["launcher_start_total"]),
+                        "app_launch_total": int(row["app_launch_total"]),
+                        "version_check_total": int(row["version_check_total"]),
+                        "update_ok_total": int(row["update_ok_total"]),
+                        "dau_unique_device": int(row["dau_unique_device"]),
+                        "dau_unique_install": int(row["dau_unique_install"]),
+                    },
+                })
+        finally:
+            conn.close()
+
+    return {
+        "channel": channel.strip() or "ALL",
+        "total_days": len(daily_stats),
+        "daily_stats": daily_stats,
+    }
+
