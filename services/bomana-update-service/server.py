@@ -233,13 +233,21 @@ def _build_manifest_result(
                 raise HTTPException(status_code=500, detail="manifest missing package_url/package_asset")
             package_url = _build_self_hosted_download_url(package_asset)
 
-    return {
+    result = {
+        "schema_version": data.get("schema_version", 1),
+        "channel": str(data.get("channel", "")).strip(),
         "app_version": app_version,
+        "min_launcher_version": str(data.get("min_launcher_version", "")).strip(),
         "package_url": package_url,
+        "package_asset": package_asset,
         "package_sha256": package_sha256,
         "entrypoint": entrypoint,
         "source_name": source_name,
     }
+    signature = data.get("manifest_signature")
+    if isinstance(signature, dict):
+        result["manifest_signature"] = signature
+    return result
 
 
 def _build_launcher_result(
@@ -273,13 +281,21 @@ def _build_launcher_result(
     if not launcher_url:
         raise HTTPException(status_code=500, detail="launcher manifest missing launcher_url")
 
-    return {
+    result = {
+        "schema_version": data.get("schema_version", 1),
         "launcher_version": launcher_version,
         "package_url": launcher_url,
+        "launcher_asset": launcher_asset,
+        "launcher_sha256": launcher_sha256,
         "package_sha256": launcher_sha256,
         "package_size": launcher_size,
+        "launcher_size_bytes": launcher_size,
         "source_name": source_name,
     }
+    signature = data.get("manifest_signature")
+    if isinstance(signature, dict):
+        result["manifest_signature"] = signature
+    return result
 
 
 def _load_manifest_from_local(channel: str) -> Dict[str, Any]:
@@ -405,26 +421,26 @@ def _load_launcher_manifest_from_github() -> Dict[str, Any]:
         if not isinstance(release, dict):
             continue
         assets = release.get("assets", []) if isinstance(release, dict) else []
-        launcher_asset = _find_launcher_asset(assets)
-        if not launcher_asset:
+        manifest_asset = _find_asset(assets, "launcher_manifest.json")
+        if not manifest_asset:
             continue
-        asset_name = str(launcher_asset.get("name", "")).strip()
-        version = _parse_launcher_version_from_asset_name(asset_name)
-        url = str(launcher_asset.get("browser_download_url", "")).strip()
-        if not version or not url:
+        manifest_url = str(manifest_asset.get("browser_download_url", "")).strip()
+        if not manifest_url:
             continue
-        result = {
-            "launcher_version": version,
-            "package_url": url,
-            "package_sha256": "",
-            "package_size": launcher_asset.get("size"),
-            "source_name": f"{SOURCE_NAME} (GitHub:{str(release.get('tag_name', 'latest')).strip() or 'latest'})",
-        }
+        try:
+            manifest_data = _http_get_json(manifest_url)
+        except Exception:
+            continue
+        result = _build_launcher_result(
+            manifest_data,
+            source_name=f"{SOURCE_NAME} (GitHub:{str(release.get('tag_name', 'latest')).strip() or 'latest'})",
+            release_assets=assets,
+        )
         with _MANIFEST_CACHE_LOCK:
             _MANIFEST_CACHE[cache_key] = {"ts": now, "value": dict(result)}
         return result
 
-    raise HTTPException(status_code=503, detail="github latest releases missing launcher asset")
+    raise HTTPException(status_code=503, detail="github latest releases missing launcher manifest")
 
 
 def _load_launcher_manifest() -> Dict[str, Any]:
