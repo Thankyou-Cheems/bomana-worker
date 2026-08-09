@@ -3,17 +3,18 @@ import os
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import quote
 from urllib.error import HTTPError, URLError
-from urllib.request import Request as URLRequest, urlopen
+from urllib.parse import quote
+from urllib.request import Request as URLRequest
+from urllib.request import urlopen
 
-from fastapi import FastAPI, HTTPException, Query, Request as FastAPIRequest
+from fastapi import FastAPI, HTTPException, Query
+from fastapi import Request as FastAPIRequest
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-
 
 MANIFEST_DIR = Path(os.environ.get("MANIFEST_DIR", "/data/manifests"))
 DB_PATH = Path(os.environ.get("DB_PATH", "/data/stats.db"))
@@ -33,11 +34,14 @@ AUTO_GITHUB_PACKAGE_URL = os.environ.get("AUTO_GITHUB_PACKAGE_URL", "1").strip()
 GITHUB_APP_RELEASE_TAG_SUFFIX = os.environ.get("GITHUB_APP_RELEASE_TAG_SUFFIX", "-app").strip()
 GITHUB_CACHE_TTL_SEC = max(30, int(os.environ.get("GITHUB_CACHE_TTL_SEC", "300").strip() or "300"))
 HTTP_TIMEOUT_SEC = max(2.0, float(os.environ.get("HTTP_TIMEOUT_SEC", "8").strip() or "8"))
+DAU_RAW_RETENTION_DAYS = 30
+DAU_DB_BUSY_TIMEOUT_SEC = 0.25
 UA = "BomanaUpdateService/1.0"
 
 app = FastAPI(title="Bomana Update Service", version="1.0.0")
 app.mount("/downloads", StaticFiles(directory=str(DOWNLOAD_DIR), check_dir=False), name="downloads")
 _DB_LOCK = threading.Lock()
+_DAU_DB_LOCK = threading.Lock()
 _MANIFEST_CACHE_LOCK = threading.Lock()
 _MANIFEST_CACHE: Dict[str, Dict[str, Any]] = {}
 
@@ -72,6 +76,19 @@ def _day_from_iso(ts: str) -> str:
 def _db_conn() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _dau_db_conn() -> sqlite3.Connection:
+    """Open the short-wait connection used by best-effort DAU collection."""
+
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(
+        str(DB_PATH),
+        check_same_thread=False,
+        timeout=DAU_DB_BUSY_TIMEOUT_SEC,
+    )
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -112,6 +129,31 @@ def _init_db() -> None:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_event ON events(event)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_day_event_channel ON events(day_utc, event, channel)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_day_device ON events(day_utc, device_id)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dau_daily_signals (
+                    day_utc TEXT NOT NULL,
+                    install_day_token TEXT NOT NULL,
+                    received_at_utc TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    PRIMARY KEY (day_utc, install_day_token)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dau_daily_aggregates (
+                    day_utc TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    active_installations INTEGER NOT NULL,
+                    PRIMARY KEY (day_utc, channel)
+                )
+                """
+            )
+            _prune_expired_dau_signals(
+                conn,
+                datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            )
             conn.commit()
         finally:
             conn.close()
@@ -233,6 +275,13 @@ def _build_manifest_result(
                 raise HTTPException(status_code=500, detail="manifest missing package_url/package_asset")
             package_url = _build_self_hosted_download_url(package_asset)
 
+    changelog_asset = str(data.get("changelog_asset", "")).strip()
+    changelog_sha256 = str(data.get("changelog_sha256", "")).strip()
+    changelog_url = str(data.get("changelog_url", "")).strip()
+    if not changelog_url and changelog_asset and not STATS_ONLY_MODE:
+        # Same downloads root as package_asset so urljoin(package_url, asset) also works.
+        changelog_url = _build_self_hosted_download_url(changelog_asset)
+
     result = {
         "schema_version": data.get("schema_version", 1),
         "channel": str(data.get("channel", "")).strip(),
@@ -244,6 +293,13 @@ def _build_manifest_result(
         "entrypoint": entrypoint,
         "source_name": source_name,
     }
+    # Forward signed changelog fields so launchers can verify the full app payload.
+    if changelog_asset:
+        result["changelog_asset"] = changelog_asset
+    if changelog_sha256:
+        result["changelog_sha256"] = changelog_sha256
+    if changelog_url:
+        result["changelog_url"] = changelog_url
     signature = data.get("manifest_signature")
     if isinstance(signature, dict):
         result["manifest_signature"] = signature
@@ -522,6 +578,100 @@ def _insert_event(request: FastAPIRequest, payload: Dict[str, Any]) -> None:
             conn.close()
 
 
+def _prune_expired_dau_signals(conn: sqlite3.Connection, current_day: str) -> None:
+    """Keep a rolling 30 UTC-day deduplication window, not a user history."""
+
+    retention_start = (
+        date.fromisoformat(current_day) - timedelta(days=DAU_RAW_RETENTION_DAYS - 1)
+    ).isoformat()
+    conn.execute(
+        "DELETE FROM dau_daily_signals WHERE day_utc < ?",
+        (retention_start,),
+    )
+
+
+def _invalid_anonymous_dau_payload() -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail="invalid anonymous daily activity payload",
+    )
+
+
+def _read_anonymous_dau_payload(payload: object) -> Dict[str, str]:
+    """Validate the deliberately small, non-identifying DAU allowlist."""
+
+    if not isinstance(payload, dict):
+        raise _invalid_anonymous_dau_payload()
+    if set(payload) != {"schema_version", "install_day_token", "channel"}:
+        raise _invalid_anonymous_dau_payload()
+
+    schema_version = payload.get("schema_version")
+    install_day_token = payload.get("install_day_token")
+    channel = payload.get("channel")
+    if (
+        type(schema_version) is not int
+        or schema_version != 1
+        or not isinstance(install_day_token, str)
+        or len(install_day_token) != 64
+        or any(char not in "0123456789abcdef" for char in install_day_token)
+        or not isinstance(channel, str)
+        or channel not in ALLOWED_CHANNELS
+    ):
+        raise _invalid_anonymous_dau_payload()
+    return {
+        "install_day_token": install_day_token,
+        "channel": channel,
+    }
+
+
+def _record_anonymous_daily_active(payload: Dict[str, str]) -> bool:
+    """Persist one daily token and increment its aggregate at most once."""
+
+    if not _DAU_DB_LOCK.acquire(timeout=DAU_DB_BUSY_TIMEOUT_SEC):
+        raise HTTPException(status_code=503, detail="anonymous daily activity unavailable")
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        current_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        conn = _dau_db_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        _prune_expired_dau_signals(conn, current_day)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO dau_daily_signals
+            (day_utc, install_day_token, received_at_utc, channel)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                current_day,
+                payload["install_day_token"],
+                _now_utc_iso(),
+                payload["channel"],
+            ),
+        )
+        inserted = bool(conn.execute("SELECT changes()").fetchone()[0])
+        if inserted:
+            conn.execute(
+                """
+                INSERT INTO dau_daily_aggregates (day_utc, channel, active_installations)
+                VALUES (?, ?, 1)
+                ON CONFLICT(day_utc, channel) DO UPDATE SET
+                active_installations = active_installations + 1
+                """,
+                (current_day, payload["channel"]),
+            )
+        conn.commit()
+        return not inserted
+    except sqlite3.Error as exc:
+        if conn is not None:
+            conn.rollback()
+        raise HTTPException(status_code=503, detail="anonymous daily activity unavailable") from exc
+    finally:
+        if conn is not None:
+            conn.close()
+        _DAU_DB_LOCK.release()
+
+
 @app.on_event("startup")
 def _on_startup() -> None:
     _ensure_runtime_dirs()
@@ -594,6 +744,38 @@ def event(request: FastAPIRequest, payload: EventPayload) -> Dict[str, Any]:
     }
 
 
+@app.post("/api/v1/telemetry/dau", status_code=202)
+async def anonymous_daily_active(request: FastAPIRequest) -> Dict[str, bool]:
+    """Collect one best-effort, daily-rotating installation signal."""
+
+    if request.query_params:
+        raise _invalid_anonymous_dau_payload()
+    content_length = request.headers.get("content-length", "").strip()
+    if content_length and (
+        not content_length.isascii()
+        or not content_length.isdecimal()
+        or int(content_length) > 1024
+    ):
+        raise _invalid_anonymous_dau_payload()
+    try:
+        raw_body = await request.body()
+    except RuntimeError as exc:
+        raise _invalid_anonymous_dau_payload() from exc
+    if len(raw_body) > 1024:
+        raise _invalid_anonymous_dau_payload()
+    try:
+        raw_payload = json.loads(raw_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _invalid_anonymous_dau_payload() from exc
+
+    payload = _read_anonymous_dau_payload(raw_payload)
+    duplicate = _record_anonymous_daily_active(payload)
+    return {
+        "accepted": True,
+        "duplicate": duplicate,
+    }
+
+
 @app.get("/api/v1/stats/daily")
 def stats_daily(
     date: str = Query("", description="UTC date, format YYYY-MM-DD; default: today"),
@@ -627,6 +809,11 @@ def stats_daily(
                 f"SELECT COUNT(1) AS n FROM events WHERE {where_sql} AND event='update_result' AND update_ok=1",
                 params,
             ).fetchone()["n"]
+            anonymous_dau_total = conn.execute(
+                f"SELECT COALESCE(SUM(active_installations), 0) AS n "
+                f"FROM dau_daily_aggregates WHERE {where_sql}",
+                params,
+            ).fetchone()["n"]
             unique_device_dau = conn.execute(
                 f"SELECT COUNT(DISTINCT device_id) AS n FROM events WHERE {where_sql} AND event='version_check' AND device_id<>''",
                 params,
@@ -647,6 +834,7 @@ def stats_daily(
             "app_launch_total": int(app_launch_total),
             "version_check_total": int(version_check_total),
             "update_ok_total": int(update_ok_total),
+            "anonymous_dau": int(anonymous_dau_total),
             "dau_unique_device": int(unique_device_dau),
             "dau_unique_install": int(unique_install_dau),
         },
@@ -699,6 +887,11 @@ def stats_summary(
                 f"SELECT COUNT(1) AS n FROM events WHERE {where_sql} AND event='update_result' AND update_ok=1",
                 params,
             ).fetchone()["n"]
+            anonymous_active_installation_days = conn.execute(
+                f"SELECT COALESCE(SUM(active_installations), 0) AS n "
+                f"FROM dau_daily_aggregates WHERE {where_sql}",
+                params,
+            ).fetchone()["n"]
 
             # DAU 相关 - 总去重用户数
             unique_device_total = conn.execute(
@@ -712,8 +905,15 @@ def stats_summary(
 
             # 获取日期范围
             date_range = conn.execute(
-                f"SELECT MIN(day_utc) as first_day, MAX(day_utc) as last_day FROM events WHERE {where_sql}",
-                params,
+                f"""
+                SELECT MIN(day_utc) AS first_day, MAX(day_utc) AS last_day
+                FROM (
+                    SELECT day_utc FROM events WHERE {where_sql}
+                    UNION ALL
+                    SELECT day_utc FROM dau_daily_aggregates WHERE {where_sql}
+                )
+                """,
+                [*params, *params],
             ).fetchone()
 
             # 按渠道分组统计
@@ -749,6 +949,7 @@ def stats_summary(
             "app_launch_total": int(app_launch_total),
             "version_check_total": int(version_check_total),
             "update_ok_total": int(update_ok_total),
+            "anonymous_active_installation_days": int(anonymous_active_installation_days),
             "total_unique_device": int(unique_device_total),
             "total_unique_install": int(unique_install_total),
         },
@@ -791,21 +992,47 @@ def stats_daily_list(
             daily_stats = []
             rows = conn.execute(
                 f"""
-                SELECT 
-                    day_utc,
-                    COUNT(1) as total_events,
-                    SUM(CASE WHEN event='launcher_start' THEN 1 ELSE 0 END) as launcher_start_total,
-                    SUM(CASE WHEN event='app_launch' THEN 1 ELSE 0 END) as app_launch_total,
-                    SUM(CASE WHEN event='version_check' THEN 1 ELSE 0 END) as version_check_total,
-                    SUM(CASE WHEN event='update_result' AND update_ok=1 THEN 1 ELSE 0 END) as update_ok_total,
-                    COUNT(DISTINCT CASE WHEN event='version_check' AND device_id<>'' THEN device_id END) as dau_unique_device,
-                    COUNT(DISTINCT CASE WHEN event='version_check' AND install_id<>'' THEN install_id END) as dau_unique_install
-                FROM events 
-                WHERE {where_sql}
-                GROUP BY day_utc
-                ORDER BY day_utc
+                WITH event_daily AS (
+                    SELECT
+                        day_utc,
+                        COUNT(1) AS total_events,
+                        SUM(CASE WHEN event='launcher_start' THEN 1 ELSE 0 END) AS launcher_start_total,
+                        SUM(CASE WHEN event='app_launch' THEN 1 ELSE 0 END) AS app_launch_total,
+                        SUM(CASE WHEN event='version_check' THEN 1 ELSE 0 END) AS version_check_total,
+                        SUM(CASE WHEN event='update_result' AND update_ok=1 THEN 1 ELSE 0 END) AS update_ok_total,
+                        COUNT(DISTINCT CASE WHEN event='version_check' AND device_id<>'' THEN device_id END) AS dau_unique_device,
+                        COUNT(DISTINCT CASE WHEN event='version_check' AND install_id<>'' THEN install_id END) AS dau_unique_install
+                    FROM events
+                    WHERE {where_sql}
+                    GROUP BY day_utc
+                ),
+                anonymous_daily AS (
+                    SELECT day_utc, SUM(active_installations) AS anonymous_dau
+                    FROM dau_daily_aggregates
+                    WHERE {where_sql}
+                    GROUP BY day_utc
+                ),
+                days AS (
+                    SELECT day_utc FROM event_daily
+                    UNION
+                    SELECT day_utc FROM anonymous_daily
+                )
+                SELECT
+                    days.day_utc,
+                    COALESCE(event_daily.total_events, 0) AS total_events,
+                    COALESCE(event_daily.launcher_start_total, 0) AS launcher_start_total,
+                    COALESCE(event_daily.app_launch_total, 0) AS app_launch_total,
+                    COALESCE(event_daily.version_check_total, 0) AS version_check_total,
+                    COALESCE(event_daily.update_ok_total, 0) AS update_ok_total,
+                    COALESCE(anonymous_daily.anonymous_dau, 0) AS anonymous_dau,
+                    COALESCE(event_daily.dau_unique_device, 0) AS dau_unique_device,
+                    COALESCE(event_daily.dau_unique_install, 0) AS dau_unique_install
+                FROM days
+                LEFT JOIN event_daily ON event_daily.day_utc = days.day_utc
+                LEFT JOIN anonymous_daily ON anonymous_daily.day_utc = days.day_utc
+                ORDER BY days.day_utc
                 """,
-                params,
+                [*params, *params],
             ).fetchall()
             for row in rows:
                 daily_stats.append({
@@ -816,6 +1043,7 @@ def stats_daily_list(
                         "app_launch_total": int(row["app_launch_total"]),
                         "version_check_total": int(row["version_check_total"]),
                         "update_ok_total": int(row["update_ok_total"]),
+                        "anonymous_dau": int(row["anonymous_dau"]),
                         "dau_unique_device": int(row["dau_unique_device"]),
                         "dau_unique_install": int(row["dau_unique_install"]),
                     },

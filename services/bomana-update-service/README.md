@@ -7,13 +7,25 @@
 ## 当前能力
 
 - `GET /healthz`：健康检查
-- `GET /api/v1/version?channel=<Channel>`：返回应用版本元数据
+- `GET /api/v1/version?channel=<Channel>`：返回 Lite/Standard 公共应用版本元数据
 - `GET /api/v1/launcher`：返回启动器版本元数据
 - `GET /downloads/<asset>`：分发应用包和启动器包
-- `POST /api/v1/event`：接收启动器/应用事件
+- `POST /api/v1/event`：接收旧版启动器/应用运维事件
+- `POST /api/v1/telemetry/dau`：接收各版本共用的匿名日活信号
 - `GET /api/v1/stats/daily`：单日统计
 - `GET /api/v1/stats/summary`：汇总统计
 - `GET /api/v1/stats/daily/list`：按日历史列表
+
+公开应用包与通用启动器的动态下载地址继续由现有 `/api/v1/version` 和
+`/api/v1/launcher` 响应中的 `package_url` / `launcher_url` 提供。Enhanced
+应用、私有清单与授权下载由 CheemsPay 的精确资源 Grant 管理；Enhanced
+地形对象可使用 Grant 响应给出的当前 CDN 基址，但仍必须按私有签名清单校验。
+服务不再另建 `/api/v1/distribution` 或第二套 Descriptor 控制面。
+
+匿名日活只接收每日轮换的安装令牌和版本渠道。它不会把请求 IP、UA、设备号、
+CheemsPay 身份或任意 JSON 保存到统计库；原始去重令牌保留 30 个 UTC 日，按日
+聚合长期保留并通过三个统计接口返回。详见仓库根目录
+`docs/anonymous-dau-contract.md`。
 
 ## 两种常见模式
 
@@ -33,11 +45,11 @@
 ```text
 data/
 ├─ manifests/
-│  ├─ manifest_Enhanced.json
 │  ├─ manifest_Standard.json
 │  └─ manifest_Lite.json
 ├─ downloads/
-│  ├─ Bomana_app_Enhanced_vX.Y.Z.zip
+│  ├─ Bomana_app_Standard_vX.Y.Z.zip
+│  ├─ Bomana_app_Lite_vX.Y.Z.zip
 │  └─ Bomana_launcher_vA.B.C.exe
 ├─ launcher_manifest.json
 └─ stats.db
@@ -47,8 +59,9 @@ data/
 
 ```json
 {
-  "app_version": "6.8.0",
-  "package_asset": "Bomana_app_Enhanced_v6.8.0.zip",
+  "channel": "Standard",
+  "app_version": "8.7.3",
+  "package_asset": "Bomana_app_Standard_v8.7.3.zip",
   "package_sha256": "...",
   "entrypoint": "Bomana.pyw"
 }
@@ -95,7 +108,8 @@ data/
 
 ```bash
 curl -s http://127.0.0.1:18080/healthz
-curl -s "http://127.0.0.1:18080/api/v1/version?channel=Enhanced"
+curl -s "http://127.0.0.1:18080/api/v1/version?channel=Standard"
 curl -s "http://127.0.0.1:18080/api/v1/launcher"
+curl -s -X POST "http://127.0.0.1:18080/api/v1/telemetry/dau" -H "content-type: application/json" -d '{"schema_version":1,"install_day_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","channel":"Lite"}'
 curl -I "http://127.0.0.1:18080/downloads/Bomana_launcher_v1.2.0.exe"
 ```
