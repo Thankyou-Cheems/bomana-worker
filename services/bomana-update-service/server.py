@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi import Request as FastAPIRequest
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.responses import Response
 
 MANIFEST_DIR = Path(os.environ.get("MANIFEST_DIR", "/data/manifests"))
 DB_PATH = Path(os.environ.get("DB_PATH", "/data/stats.db"))
@@ -36,6 +37,11 @@ GITHUB_CACHE_TTL_SEC = max(30, int(os.environ.get("GITHUB_CACHE_TTL_SEC", "300")
 HTTP_TIMEOUT_SEC = max(2.0, float(os.environ.get("HTTP_TIMEOUT_SEC", "8").strip() or "8"))
 DAU_RAW_RETENTION_DAYS = 30
 DAU_DB_BUSY_TIMEOUT_SEC = 0.25
+DAU_WEB_ORIGIN = (
+    os.environ.get("DAU_WEB_ORIGIN", "https://bomana.ruikang.wang")
+    .strip()
+    .rstrip("/")
+)
 UA = "BomanaUpdateService/1.0"
 
 app = FastAPI(title="Bomana Update Service", version="1.0.0")
@@ -44,6 +50,59 @@ _DB_LOCK = threading.Lock()
 _DAU_DB_LOCK = threading.Lock()
 _MANIFEST_CACHE_LOCK = threading.Lock()
 _MANIFEST_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _dau_cors_headers() -> dict[str, str]:
+    return {
+        "Access-Control-Allow-Origin": DAU_WEB_ORIGIN,
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Max-Age": "600",
+        "Cache-Control": "no-store",
+        "Vary": "Origin",
+    }
+
+
+@app.middleware("http")
+async def anonymous_daily_active_cors(request: FastAPIRequest, call_next):
+    """Expose only the anonymous DAU input to the exact Bomana Web origin."""
+
+    if request.url.path != "/api/v1/telemetry/dau":
+        return await call_next(request)
+    origin = request.headers.get("origin", "").strip().rstrip("/")
+    if request.method == "OPTIONS":
+        requested_method = request.headers.get(
+            "access-control-request-method", ""
+        ).upper()
+        requested_headers = {
+            value.strip().lower()
+            for value in request.headers.get(
+                "access-control-request-headers", ""
+            ).split(",")
+            if value.strip()
+        }
+        valid_preflight = (
+            origin == DAU_WEB_ORIGIN
+            and requested_method == "POST"
+            and requested_headers == {"content-type"}
+        )
+        if not valid_preflight:
+            return Response(
+                status_code=403,
+                headers={"Cache-Control": "no-store", "Vary": "Origin"},
+            )
+        return Response(status_code=204, headers=_dau_cors_headers())
+    if origin and origin != DAU_WEB_ORIGIN:
+        return Response(
+            status_code=403,
+            headers={"Cache-Control": "no-store", "Vary": "Origin"},
+        )
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    if origin == DAU_WEB_ORIGIN:
+        for name, value in _dau_cors_headers().items():
+            response.headers[name] = value
+    return response
 
 
 class EventPayload(BaseModel):
@@ -835,7 +894,13 @@ def stats_daily(
             "version_check_total": int(version_check_total),
             "update_ok_total": int(update_ok_total),
             "anonymous_dau": int(anonymous_dau_total),
-            "dau_unique_device": int(unique_device_dau),
+            # Preserve the public DAU badge during the legacy-to-Web cutover.
+            # The sets cannot be joined without reintroducing identity, so the
+            # larger privacy-safe count is the conservative product DAU.
+            "dau_unique_device": max(
+                int(unique_device_dau), int(anonymous_dau_total)
+            ),
+            "legacy_dau_unique_device": int(unique_device_dau),
             "dau_unique_install": int(unique_install_dau),
         },
     }
@@ -1035,6 +1100,8 @@ def stats_daily_list(
                 [*params, *params],
             ).fetchall()
             for row in rows:
+                anonymous_dau = int(row["anonymous_dau"])
+                legacy_device_dau = int(row["dau_unique_device"])
                 daily_stats.append({
                     "date_utc": row["day_utc"],
                     "metrics": {
@@ -1043,8 +1110,11 @@ def stats_daily_list(
                         "app_launch_total": int(row["app_launch_total"]),
                         "version_check_total": int(row["version_check_total"]),
                         "update_ok_total": int(row["update_ok_total"]),
-                        "anonymous_dau": int(row["anonymous_dau"]),
-                        "dau_unique_device": int(row["dau_unique_device"]),
+                        "anonymous_dau": anonymous_dau,
+                        "dau_unique_device": max(
+                            legacy_device_dau, anonymous_dau
+                        ),
+                        "legacy_dau_unique_device": legacy_device_dau,
                         "dau_unique_install": int(row["dau_unique_install"]),
                     },
                 })

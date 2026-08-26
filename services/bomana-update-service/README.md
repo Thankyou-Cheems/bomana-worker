@@ -27,6 +27,10 @@ CheemsPay 身份或任意 JSON 保存到统计库；原始去重令牌保留 30 
 聚合长期保留并通过三个统计接口返回。详见仓库根目录
 `docs/anonymous-dau-contract.md`。
 
+浏览器版 Bomana 仍使用同一接口和统计口径。服务只对
+`https://bomana.ruikang.wang` 开放该路径的精确 CORS 预检与响应，不向其他统计、
+更新或旧事件路径扩散浏览器写入权限。
+
 ## 两种常见模式
 
 ### 1. 自托管分发

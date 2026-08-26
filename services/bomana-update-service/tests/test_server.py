@@ -107,11 +107,16 @@ class UpdateServiceHttpTest(unittest.TestCase):
         summary = self.client.get("/api/v1/stats/summary")
 
         self.assertEqual(daily.json()["metrics"]["anonymous_dau"], 1)
+        self.assertEqual(daily.json()["metrics"]["dau_unique_device"], 1)
+        self.assertEqual(daily.json()["metrics"]["legacy_dau_unique_device"], 0)
         self.assertEqual(standard_daily.json()["metrics"]["anonymous_dau"], 1)
         self.assertEqual(enhanced_daily.json()["metrics"]["anonymous_dau"], 0)
         self.assertEqual(history.json()["total_days"], 1)
         self.assertEqual(
             history.json()["daily_stats"][0]["metrics"]["anonymous_dau"], 1
+        )
+        self.assertEqual(
+            history.json()["daily_stats"][0]["metrics"]["dau_unique_device"], 1
         )
         self.assertEqual(
             summary.json()["metrics"]["anonymous_active_installation_days"],
@@ -126,6 +131,49 @@ class UpdateServiceHttpTest(unittest.TestCase):
             raw_columns,
             {"day_utc", "install_day_token", "received_at_utc", "channel"},
         )
+
+    def test_daily_active_allows_only_the_exact_bomana_web_cors_contract(self):
+        headers = {
+            "Origin": "https://bomana.ruikang.wang",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        }
+        preflight = self.client.options("/api/v1/telemetry/dau", headers=headers)
+        self.assertEqual(preflight.status_code, 204)
+        self.assertEqual(
+            preflight.headers["access-control-allow-origin"],
+            "https://bomana.ruikang.wang",
+        )
+        self.assertEqual(
+            preflight.headers["access-control-allow-methods"], "POST, OPTIONS"
+        )
+        self.assertEqual(
+            preflight.headers["access-control-allow-headers"], "Content-Type"
+        )
+
+        accepted = self.client.post(
+            "/api/v1/telemetry/dau",
+            headers={"Origin": "https://bomana.ruikang.wang"},
+            json={
+                "schema_version": 1,
+                "install_day_token": "f" * 64,
+                "channel": "Lite",
+            },
+        )
+        self.assertEqual(accepted.status_code, 202)
+        self.assertEqual(
+            accepted.headers["access-control-allow-origin"],
+            "https://bomana.ruikang.wang",
+        )
+
+        rejected = self.client.options(
+            "/api/v1/telemetry/dau",
+            headers={**headers, "Origin": "https://evil.example"},
+        )
+        self.assertEqual(rejected.status_code, 403)
+        self.assertNotIn("access-control-allow-origin", rejected.headers)
+        unrelated = self.client.options("/api/v1/event", headers=headers)
+        self.assertEqual(unrelated.status_code, 405)
 
     def test_daily_active_rejects_disallowed_data_without_persisting_it(self):
         response = self.client.post(

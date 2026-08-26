@@ -46,9 +46,20 @@ Aggregate values are exposed as:
   `metrics.anonymous_active_installation_days`, the sum of daily counts over the
   selected period rather than a cross-day unique-person count.
 
+The existing public `metrics.dau_unique_device` field remains a compatibility
+product-DAU view during migration. It is the larger of the legacy device count
+and `anonymous_dau`, never their sum, because the two anonymous sets cannot be
+joined without restoring an identity. The raw legacy value is separately
+exposed as `metrics.legacy_dau_unique_device`.
+
 ## Client integration
 
 Launcher 3.5.4 and later schedules the report after the user launches any
 edition. Standalone Green Lite uses the same payload contract. Both calls are
 best-effort, run outside the startup-critical path with a short timeout, and do
 not retry through the legacy event endpoint.
+
+Browser-native Bomana Web uses the same payload after an Edition initializes.
+The collector accepts browser requests only from the exact
+`https://bomana.ruikang.wang` origin and exposes CORS only on this DAU path;
+Bridge and CheemsPay do not participate in reporting.
