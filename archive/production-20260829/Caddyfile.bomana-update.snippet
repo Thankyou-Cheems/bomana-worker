@@ -1,0 +1,67 @@
+# Add this site block into your main HomeLab Caddyfile.
+# This keeps Bomana update service in a separate compose stack.
+
+http://bomanaupdate.ruikang.wang, https://bomanaupdate.ruikang.wang {
+  import compression
+  import security_headers
+
+  @launcher_json path /launcher_manifest.json /downloads/launcher_manifest.json
+  handle @launcher_json {
+    root * /opt/stacks/bomana-update/data
+    header Cache-Control "no-store, no-cache, must-revalidate, private"
+    header -Pragma
+    header -Expires
+    file_server
+  }
+
+  @manifests path /manifests/*
+  handle @manifests {
+    root * /opt/stacks/bomana-update/data
+    header Cache-Control "no-store, no-cache, must-revalidate, private"
+    header -Pragma
+    header -Expires
+    file_server
+  }
+
+  # Mutable signed terrain metadata must bypass the immutable download rule.
+  # Content-addressed BTH objects and versioned source archives remain immutable.
+
+  handle /downloads/terrain/terrain_manifest.json {
+    root * /opt/stacks/bomana-update/data
+    header Cache-Control "no-store, no-cache, must-revalidate, private"
+    header -Pragma
+    header -Expires
+    file_server
+  }
+
+  handle /downloads/terrain/checksums_terrain.txt {
+    root * /opt/stacks/bomana-update/data
+    header Cache-Control "no-store, no-cache, must-revalidate, private"
+    header -Pragma
+    header -Expires
+    file_server
+  }
+
+  @downloads path /downloads/*
+  handle @downloads {
+    root * /opt/stacks/bomana-update/data
+    header Cache-Control "public, max-age=31536000, immutable"
+    header -Pragma
+    header -Expires
+    header -X-Accel-Buffering
+    file_server
+  }
+
+  handle {
+    reverse_proxy bomana-update:8080 {
+      import rp_defaults
+      health_uri /healthz
+      fail_duration 10s
+      max_fails 3
+      header_down Cache-Control "no-store, no-cache, must-revalidate, private"
+      header_down Pragma "no-cache"
+      header_down Expires "0"
+      header_down X-Accel-Buffering "no"
+    }
+  }
+}
