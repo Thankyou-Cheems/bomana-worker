@@ -1,49 +1,18 @@
-# bomana-worker
+# bomana-worker (archived)
 
-Public service-side components used by Bomana.
+This repository preserves the retired Bomana update-service implementations. It is not a deployable current Bomana service.
 
-This repository is intentionally public-safe:
+The production Python `bomana-update` container was stopped on 2026-08-29. Current Bomana uses:
 
-- no secrets
-- no private server addresses
-- no runtime `data/` contents
-- all example domains use `update.example.com`
+- static signed Terrain distribution owned by `Thankyou-Cheems/Bomana-Super-Bomb`;
+- the bounded `bomana-anonymous-metrics` service for Anonymous Daily Active Signals and aggregate reads;
+- the browser Launcher/App and Bridge release surfaces hosted by the product repository.
 
-## Repository Layout
+Legacy Launcher/App manifests, general event intake, Python package delivery, and the Cloudflare reverse proxy are retired. Their public URLs return `410 Gone` where compatibility requires an explicit retirement response.
 
-- `src/index.js`: optional Cloudflare Worker reverse proxy
-- `wrangler.jsonc`: Worker configuration
-- `services/bomana-update-service/`: FastAPI update service
+## Archive layout
 
-## Bomana Update Service
+- `archive/production-20260829/`: exact public-safe source and deployment files copied from the final stopped TencentCloudPublic stack before server deletion.
+- `archive/repository-main-20260628/`: the former default-branch FastAPI and Cloudflare Worker source as it existed before retirement.
 
-Path: `services/bomana-update-service/`
-
-Current capabilities:
-
-- `GET /api/v1/version`: app update manifest by channel
-- `GET /api/v1/launcher`: launcher self-update manifest
-- `GET /downloads/<asset>`: static file delivery for app and launcher packages
-- `POST /api/v1/event`: launcher/app telemetry events
-- `GET /api/v1/stats/daily`, `GET /api/v1/stats/summary`, `GET /api/v1/stats/daily/list`
-- `GET /healthz`: health check
-
-The service supports two deployment styles:
-
-- self-hosted downloads: local manifests + same-origin `/downloads/*`
-- GitHub fallback: use GitHub release manifests and package URLs when local files are unavailable
-
-## Cloudflare Worker
-
-`src/index.js` is a thin reverse proxy for edge routing. It reads `UPDATE_ORIGIN` from the Worker environment and forwards:
-
-- `/healthz`
-- `/api/*`
-- `/downloads/*`
-
-If you do not need an edge proxy, deploy the FastAPI service directly behind your own reverse proxy.
-
-## Deployment
-
-- Service docs: `services/bomana-update-service/README.md`
-- Homelab example: `services/bomana-update-service/examples/homelab/DEPLOY_CN.md`
+Runtime databases, package archives, logs, caches, credentials, and private server configuration are intentionally excluded. See the production snapshot provenance file for exact hashes and custody details.
